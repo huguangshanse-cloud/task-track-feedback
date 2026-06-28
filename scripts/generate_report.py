@@ -17,6 +17,7 @@ import sys
 import re
 from datetime import datetime, timedelta
 from collections import defaultdict
+from itertools import chain
 
 # 责任人userId -> 姓名映射
 USERS = {
@@ -40,61 +41,70 @@ USER_DEPT = {
 }
 
 
-def extract_latest_date(text):
-    """从落实情况文本中提取最近的日期"""
+def extract_all_dates(text):
+    """从文本中提取所有日期，返回 [(datetime, str), ...] 按日期降序排列"""
     if not text:
-        return None, ""
+        return []
 
     current_year = datetime.now().year
-    latest_date = None
-    latest_str = ""
+    found = []
 
-    # 匹配常见日期格式如 6.28, 6/28
-    for match in re.finditer(r'(?<!\d)(\d{1,2})[.](\d{1,2})(?!\d)', text):
+    # 模式1: 6.28 / 6/28 格式（注意不能匹配版本号如 5.16 中的纯数字）
+    # 要求前面是空白或中文标点，后面是中文/空白/标点
+    pattern1 = re.finditer(r'(?:^|[^.])(\d{1,2})[.](\d{1,2})(?=[^.\d]|$)', text)
+    for m in pattern1:
         try:
-            m, d = int(match.group(1)), int(match.group(2))
-            if 1 <= m <= 12 and 1 <= d <= 31:
-                dt = datetime(current_year, m, d)
-                if latest_date is None or dt > latest_date:
-                    latest_date = dt
-                    latest_str = f"{m}.{d}"
+            mon, day = int(m.group(1)), int(m.group(2))
+            if 1 <= mon <= 12 and 1 <= day <= 31:
+                dt = datetime(current_year, mon, day)
+                found.append((dt, f"{mon}.{day}"))
         except ValueError:
             continue
 
-    # 匹配 6月28日 格式
-    for match in re.finditer(r'(\d{1,2})月(\d{1,2})日', text):
+    # 模式2: 6月28日 / 6月28
+    pattern2 = re.finditer(r'(\d{1,2})月(\d{1,2})日?', text)
+    for m in pattern2:
         try:
-            m, d = int(match.group(1)), int(match.group(2))
-            if 1 <= m <= 12 and 1 <= d <= 31:
-                dt = datetime(current_year, m, d)
-                if latest_date is None or dt > latest_date:
-                    latest_date = dt
-                    latest_str = f"{m}.{d}"
+            mon, day = int(m.group(1)), int(m.group(2))
+            if 1 <= mon <= 12 and 1 <= day <= 31:
+                dt = datetime(current_year, mon, day)
+                found.append((dt, f"{mon}.{day}"))
         except ValueError:
             continue
 
-    return latest_date, latest_str
+    # 去重并按日期降序
+    seen = set()
+    unique = []
+    for dt, s in sorted(found, key=lambda x: x[0], reverse=True):
+        key = (dt.month, dt.day)
+        if key not in seen:
+            seen.add(key)
+            unique.append((dt, s))
+
+    return unique
+
+
+def extract_latest_date(text):
+    """从落实情况文本中提取最近的日期"""
+    dates = extract_all_dates(text)
+    if dates:
+        return dates[0]  # (datetime, str)
+    return None, ""
 
 
 def summarize_weekly(text):
-    """将落实情况文本简化为摘要"""
+    """将落实情况文本简化为摘要（取前3条关键事件）"""
     if not text or not text.strip():
         return ""
 
-    lines = text.strip().split("\n")
+    lines = [line.strip() for line in text.strip().split("\n") if line.strip()]
     events = []
     for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        if len(line) > 60:
-            line = line[:58] + "…"
+        if len(line) > 50:
+            line = line[:48] + "…"
         events.append(line)
 
-    if not events:
-        return ""
-
-    return "；".join(events[:4])
+    return "；".join(events[:3])
 
 
 def get_risk_marker(status, latest_date, period_start, has_summary):
@@ -134,10 +144,7 @@ def main():
     if not records:
         records = raw.get("data", {}).get("records", [])
 
-    print(f"共读取 {len(records)} 条记录", file=sys.stderr)
-
     period_start = datetime.strptime(period_start_str, "%Y-%m-%d")
-    period_end = datetime.strptime(period_end_str, "%Y-%m-%d")
 
     # 按责任人分析
     tasks = defaultdict(list)
@@ -167,28 +174,34 @@ def main():
             "has_summary": bool(summary),
         })
 
+    # 输出统计到stderr
     for name in USER_ORDER:
         if name in tasks:
             total = len(tasks[name])
             unfin = sum(1 for i in tasks[name] if i["status"] != "已完成")
-            print(f"  {name}: 共{total}项, 未完成{unfin}项", file=sys.stderr)
+            print(f"{name}: total={total} unfinished={unfin}", file=sys.stderr)
 
     # 生成Markdown
     lines = []
     lines.append("# 运营项目部任务进度追踪 — 未完成任务跟踪报表\n")
     lines.append(f"**统计周期：** {period_start_str} ~ {period_end_str}")
     lines.append(f"**生成日期：** {datetime.now().strftime('%Y-%m-%d')}")
-    lines.append(f"**数据源：** 运营项目部任务管理系统\n")
+    lines.append(f"**数据源：** 运营项目部任务管理系统（自动获取，{len(records)}条记录）\n")
     lines.append("---")
 
     risk_map = {}
+    all_done_tasks = defaultdict(list)  # 记录已完成任务以便备注
 
     for name in USER_ORDER:
         if name not in tasks:
             continue
         items = tasks[name]
         dept = USER_DEPT.get(name, "")
+        done = [i for i in items if i["status"] == "已完成"]
         unfinished = [i for i in items if i["status"] != "已完成"]
+
+        if done:
+            all_done_tasks[name] = done
 
         if not unfinished:
             continue
@@ -215,47 +228,40 @@ def main():
             if len(status_text) > 78:
                 status_text = status_text[:76] + "…"
 
-            # 标记文字
-            marker_label = marker
-            if marker == "⚪":
-                marker_label = "⚪"
-            elif marker == "🚨":
-                marker_label = "🚨"
-            elif marker == "🟡":
-                marker_label = "🟡"
-            elif marker == "🔴":
-                marker_label = "🔴"
-            elif marker == "✅":
-                marker_label = "✅"
+            lines.append(f"| {task_short} | {status} | {status_text} | {marker} |")
+            risk_map.setdefault(marker, []).append(f"{item['task'][:40]}…" if len(item['task']) > 40 else item['task'])
 
-            lines.append(f"| {task_short} | {status} | {status_text} | {marker_label} |")
-
-            risk_map.setdefault(marker, []).append(f"{item['task']} — {name}")
+        # 备注已完成任务
+        if done:
+            done_names = "、".join([d['task'][:20] + "…" if len(d['task']) > 20 else d['task'] for d in done])
+            lines.append(f"\n> ✅ **已完成无需跟踪：** {done_names}")
 
     # 整体风险总览
-    lines.append("\n---\n")
+    lines.append("\n\n---\n")
     lines.append("## 📊 整体风险总览\n")
 
-    markers_desc = {
-        "✅": "近7天有更新（正常推进）",
-        "🟡": "近14天无更新（需关注）",
-        "🔴": "超14天无更新（需重点跟进）",
-        "🚨": "无任何工作开展记录",
-        "⚪": "未启动",
-    }
+    categories = [
+        ("✅", "近7天有更新（正常推进）"),
+        ("🟡", "近14天无更新（需关注）"),
+        ("🔴", "超14天无更新（需重点跟进）"),
+        ("🚨", "无任何工作开展记录"),
+        ("⚪", "未启动"),
+    ]
 
-    for m in ["✅", "🟡", "🔴", "🚨", "⚪"]:
-        items = risk_map.get(m, [])
+    for key, desc in categories:
+        items = risk_map.get(key, [])
         if items:
-            lines.append(f"**{markers_desc[m]}：**")
-            for i in items[:8]:
+            lines.append(f"**{desc}：{len(items)}项**")
+            # 按责任人分组展示
+            for i in items[:6]:
                 lines.append(f"- {i}")
-            if len(items) > 8:
+            if len(items) > 6:
                 lines.append(f"- … 共{len(items)}项")
             lines.append("")
 
     lines.append("---")
-    lines.append(f"> 📌 统计周期 {period_start_str} ~ {period_end_str}")
+    lines.append(f"> 📌 统计周期 {period_start_str} ~ {period_end_str} | 数据来源：运营项目部任务管理系统")
+
     print("\n".join(lines))
 
 
