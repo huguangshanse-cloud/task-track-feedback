@@ -1,0 +1,4 @@
+﻿interface:
+  display_name: "运营项目部任务跟踪反馈"
+  short_description: "运营项目部任务进度追踪报表生成与推送。读取AI表格任务数据，按责任人分析各任务近N天进展，标注风险项，生成钉钉群Markdown报表。"
+  default_prompt: "跟踪反馈运营项目部任务"
