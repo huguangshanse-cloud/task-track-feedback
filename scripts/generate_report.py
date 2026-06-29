@@ -1,14 +1,15 @@
 ﻿#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-运营项目部任务进度追踪 — 报表生成脚本
+运营项目部任务进度追踪 - 报表生成脚本
 
 从AI表格读取任务数据，按责任人分组，分析近N天内是否有更新，
-生成钉钉友好的Markdown报表（纯文字序号列表，适配手机端）。
+生成纯文字序号列表形式的Markdown报表（适配手机端）。
 
-用法：
-  python scripts/generate_report.py <all_records.json> <period_start> <period_end>
+用法:
+  python scripts/generate_report.py <records.json> <period_start> <period_end>
 
-示例：
+示例:
   python scripts/generate_report.py all_records.json 2026-06-21 2026-06-28
 """
 
@@ -17,9 +18,11 @@ import sys
 import re
 from datetime import datetime, timedelta
 from collections import defaultdict
-from itertools import chain
 
-# 责任人userId -> 姓名映射
+# 修复 Windows 控制台编码问题
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 USERS = {
     "010303275029427647": "王立江",
     "0251316026046228": "朱一鸣",
@@ -31,256 +34,173 @@ USERS = {
 
 USER_ORDER = ["王立江", "朱一鸣", "张鹏明", "张翔", "沈刚", "张柬柬"]
 
-
-def extract_all_dates(text):
-    """从文本中提取所有日期，返回 [(datetime, str), ...] 按日期降序排列"""
-    if not text:
-        return []
-
-    current_year = datetime.now().year
-    found = []
-
-    # 模式1: 6.28 / 6/28 格式
-    pattern1 = re.finditer(r'(?:^|[^.])(\d{1,2})[.](\d{1,2})(?=[^.\d]|$)', text)
-    for m in pattern1:
-        try:
-            mon, day = int(m.group(1)), int(m.group(2))
-            if 1 <= mon <= 12 and 1 <= day <= 31:
-                dt = datetime(current_year, mon, day)
-                found.append((dt, f"{mon}.{day}"))
-        except ValueError:
-            continue
-
-    # 模式2: 6月28日 / 6月28
-    pattern2 = re.finditer(r'(\d{1,2})月(\d{1,2})日?', text)
-    for m in pattern2:
-        try:
-            mon, day = int(m.group(1)), int(m.group(2))
-            if 1 <= mon <= 12 and 1 <= day <= 31:
-                dt = datetime(current_year, mon, day)
-                found.append((dt, f"{mon}.{day}"))
-        except ValueError:
-            continue
-
-    # 去重并按日期降序
-    seen = set()
-    unique = []
-    for dt, s in sorted(found, key=lambda x: x[0], reverse=True):
-        key = (dt.month, dt.day)
-        if key not in seen:
-            seen.add(key)
-            unique.append((dt, s))
-
-    return unique
+EMOJI_CHECK = "\u2705"
+EMOJI_WARN = "\U0001f7e1"
+EMOJI_CRIT = "\U0001f534"
+EMOJI_NONE = "\U0001f6a8"
+EMOJI_IDLE = "\u26aa"
 
 
 def extract_latest_date(text):
-    """从落实情况文本中提取最近的日期"""
-    dates = extract_all_dates(text)
-    if dates:
-        return dates[0]
+    """从落实情况文本中提取最近日期"""
+    if not text:
+        return None, ""
+    y = datetime.now().year
+    found = []
+    for m in re.finditer(r"(?:^|[^.])(\d{1,2})[.](\d{1,2})(?=[^.\d]|$)", text):
+        try:
+            mo, d = int(m.group(1)), int(m.group(2))
+            if 1 <= mo <= 12 and 1 <= d <= 31:
+                found.append((datetime(y, mo, d), f"{mo}.{d}"))
+        except ValueError:
+            pass
+    for m in re.finditer(r"(\d{1,2})\u6708(\d{1,2})\u65e5?", text):
+        try:
+            mo, d = int(m.group(1)), int(m.group(2))
+            if 1 <= mo <= 12 and 1 <= d <= 31:
+                found.append((datetime(y, mo, d), f"{mo}.{d}"))
+        except ValueError:
+            pass
+    seen = set()
+    for dt, s in sorted(found, key=lambda x: x[0], reverse=True):
+        k = (dt.month, dt.day)
+        if k not in seen:
+            seen.add(k)
+            return dt, s
     return None, ""
 
 
-def summarize_weekly(text):
-    """将落实情况文本简化为摘要（取前2条关键事件）"""
+def summarize(text):
+    """简化落实情况文本为摘要"""
     if not text or not text.strip():
         return ""
-
-    lines = [line.strip() for line in text.strip().split("\n") if line.strip()]
-    events = []
-    for line in lines:
-        if len(line) > 40:
-            line = line[:38] + "…"
-        events.append(line)
-
-    return "；".join(events[:2])
+    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+    events = [l[:35] + "\u2026" if len(l) > 35 else l for l in lines]
+    return "\uff1b".join(events[:2])
 
 
-def get_risk_marker(status, latest_date, period_start, has_summary):
-    """判断风险标记"""
-    if status == "未开始":
-        return "⚪"
-
-    if not has_summary:
-        return "🚨"
-
-    if latest_date is None:
-        return "🚨"
-
-    two_weeks_ago = period_start - timedelta(days=14)
-
+def get_risk(status, latest_date, period_start, has_summary):
+    """判断风险等级"""
+    if status == "\u672a\u5f00\u59cb":
+        return EMOJI_IDLE
+    if not has_summary or latest_date is None:
+        return EMOJI_NONE
     if latest_date >= period_start:
-        return "✅"
-    elif latest_date >= two_weeks_ago:
-        return "🟡"
+        return EMOJI_CHECK
+    elif latest_date >= period_start - timedelta(days=14):
+        return EMOJI_WARN
     else:
-        return "🔴"
-
-
-def build_task_line(idx, task_name, status, summary, latest_str, marker):
-    """构建单条任务描述"""
-    # 截取任务名
-    name_display = task_name
-    if len(name_display) > 50:
-        name_display = name_display[:48] + "…"
-
-    # 构建概况
-    parts = []
-    if not summary:
-        parts.append("未记录工作开展情况")
-    else:
-        if latest_str:
-            summary += f"（最近：{latest_str}）"
-        parts.append(summary)
-
-    # 如果概况太长
-    desc = "；".join(parts)
-    if len(desc) > 80:
-        desc = desc[:78] + "…"
-
-    return f"{idx}. **{name_display}**（{status}）— {desc} {marker}"
-
-
-def build_summary_line(risk_map):
-    """构建风险统计行"""
-    categories = [
-        ("✅", "正常推进"),
-        ("🟡", "需关注"),
-        ("🔴", "需重点跟进"),
-        ("🚨", "无记录"),
-        ("⚪", "未启动"),
-    ]
-
-    parts = []
-    for key, label in categories:
-        items = risk_map.get(key, [])
-        if items:
-            parts.append(f"**{label}（{len(items)}项）**")
-
-    return " | ".join(parts)
+        return EMOJI_CRIT
 
 
 def main():
     if len(sys.argv) < 4:
-        print("用法: python generate_report.py <records.json> <period_start> <period_end>", file=sys.stderr)
+        print("usage: script <records.json> <period_start> <period_end>", file=sys.stderr)
         sys.exit(1)
 
-    records_file = sys.argv[1]
-    period_start_str = sys.argv[2]
-    period_end_str = sys.argv[3]
-
-    with open(records_file, "r", encoding="utf-8-sig") as f:
+    with open(sys.argv[1], "r", encoding="utf-8-sig") as f:
         raw = json.load(f)
 
     records = raw.get("records", [])
     if not records:
         records = raw.get("data", {}).get("records", [])
 
-    period_start = datetime.strptime(period_start_str, "%Y-%m-%d")
+    ps = datetime.strptime(sys.argv[2], "%Y-%m-%d")
+    pe = sys.argv[3]
 
-    # 按责任人分析
     tasks = defaultdict(list)
     for rec in records:
         cells = rec.get("cells", {})
-        task_name = (cells.get("GIUguy6") or "").strip()
-        if not task_name:
+        tn = (cells.get("GIUguy6") or "").strip()
+        if not tn:
             continue
-
-        status_cell = cells.get("CA1vMY7") or {}
-        status = status_cell.get("name", "") if isinstance(status_cell, dict) else ""
-
-        person_cell = cells.get("ojHKFAE") or []
-        uid = person_cell[0]["userId"] if isinstance(person_cell, list) and person_cell else "未知"
+        sc = cells.get("CA1vMY7") or {}
+        st = sc.get("name", "") if isinstance(sc, dict) else ""
+        pc = cells.get("ojHKFAE") or []
+        uid = pc[0]["userId"] if isinstance(pc, list) and pc else "\u672a\u77e5"
         name = USERS.get(uid, uid)
-
-        weekly_text = cells.get("BqwY0AR") or ""
-        latest_date, latest_str = extract_latest_date(weekly_text)
-        summary = summarize_weekly(weekly_text)
-
+        wt = cells.get("BqwY0AR") or ""
+        ld, ls = extract_latest_date(wt)
         tasks[name].append({
-            "task": task_name,
-            "status": status,
-            "summary": summary,
-            "latest_date": latest_date,
-            "latest_str": latest_str,
-            "has_summary": bool(summary),
+            "task": tn,
+            "status": st,
+            "summary": summarize(wt),
+            "latest_date": ld,
+            "latest_str": ls,
+            "has_summary": bool(summarize(wt)),
         })
 
-    # 输出统计到stderr
-    for name in USER_ORDER:
-        if name in tasks:
-            total = len(tasks[name])
-            unfin = sum(1 for i in tasks[name] if i["status"] != "已完成")
-            print(f"{name}: total={total} unfinished={unfin}", file=sys.stderr)
+    # stderr 输出统计
+    for n in USER_ORDER:
+        if n in tasks:
+            t = len(tasks[n])
+            u = sum(1 for i in tasks[n] if i["status"] != "\u5df2\u5b8c\u6210")
+            print(f"{n}: total={t} unfin={u}", file=sys.stderr)
 
-    # 生成Markdown（纯文字序号列表，无表格）
-    lines = []
-    lines.append("# 运营项目部任务进度追踪 — 未完成任务跟踪报表\n")
-    lines.append(f"**统计周期：** {period_start_str} ~ {period_end_str} | **生成日期：** {datetime.now().strftime('%Y-%m-%d')}")
-    lines.append(f"**数据源：** 运营项目部任务管理系统（{len(records)}条记录）\n")
-    lines.append("---")
-
-    risk_map = {}
-
-    for name in USER_ORDER:
-        if name not in tasks:
-            continue
-        items = tasks[name]
-        done = [i for i in items if i["status"] == "已完成"]
-        unfinished = [i for i in items if i["status"] != "已完成"]
-
-        if not unfinished:
-            continue
-
-        lines.append(f"\n## 📋 {name} — 未完成{len(unfinished)}项 / 已完{len(done)}项\n")
-
-        for idx, item in enumerate(unfinished, 1):
-            marker = get_risk_marker(item["status"], item["latest_date"], period_start, item["has_summary"])
-            line = build_task_line(idx, item["task"], item["status"], item["summary"], item["latest_str"], marker)
-            lines.append(line)
-
-        risk_map.setdefault(marker, []).append(f"{item['task'][:30]}…" if len(item['task']) > 30 else item['task'])
-
-    # 任务总览
-    lines.append("\n---\n")
-    lines.append("## 📋 任务总览\n")
-    lines.append("| 状态 | 数量 | 说明 |")
-    lines.append("|------|------|------|")
-
-    # 按责任人统计各风险等级的数量
-    person_risk_count = defaultdict(lambda: defaultdict(int))
-    for name in USER_ORDER:
-        if name not in tasks:
-            continue
-        items = tasks[name]
-        unfinished = [i for i in items if i["status"] != "已完成"]
-        for item in unfinished:
-            marker = get_risk_marker(item["status"], item["latest_date"], period_start, item["has_summary"])
-            person_risk_count[marker][name] += 1
-            risk_map.setdefault(marker, []).append(name)
-
-    categories = [
-        ("✅", "正常推进"),
-        ("🟡", "需关注"),
-        ("🔴", "需重点跟进"),
-        ("🚨", "无记录"),
-        ("⚪", "未启动"),
+    # 生成 Markdown
+    lines = [
+        "# 运营项目部任务进度追踪 - 未完成任务跟踪报表",
+        "",
+        f"**统计周期:** {sys.argv[2]} ~ {pe} | **生成日期:** {datetime.now().strftime('%Y-%m-%d')}",
+        f"**数据源:** 运营项目部任务管理系统({len(records)}条记录)",
+        "",
+        "---",
     ]
 
-    for key, label in categories:
-        person_counts = person_risk_count.get(key, {})
-        if not person_counts:
+    risk_person = defaultdict(lambda: defaultdict(int))
+
+    for name in USER_ORDER:
+        if name not in tasks:
             continue
-        total_count = sum(person_counts.values())
-        detail = "、".join([f"{n}×{c}" for n, c in sorted(person_counts.items(), key=lambda x: -x[1])])
-        lines.append(f"| {key} {label} | {total_count}项 | {detail} |")
+        items = tasks[name]
+        done = [i for i in items if i["status"] == "\u5df2\u5b8c\u6210"]
+        unfin = [i for i in items if i["status"] != "\u5df2\u5b8c\u6210"]
+        if not unfin:
+            continue
 
-    lines.append("")
-    lines.append("---")
-    lines.append(f"> 📌 统计周期 {period_start_str} ~ {period_end_str}")
+        lines.append("")
+        lines.append(f"## {name} - 未完成{len(unfin)}项 / 已完{len(done)}项")
+        lines.append("")
 
-    print("\n".join(lines))
+        for idx, item in enumerate(unfin, 1):
+            m = get_risk(item["status"], item["latest_date"], ps, item["has_summary"])
+            risk_person[m][name] += 1
+
+            tname = item["task"][:40] + "\u2026" if len(item["task"]) > 40 else item["task"]
+            if not item["has_summary"]:
+                desc = "\u672a\u8bb0\u5f55\u5de5\u4f5c\u5f00\u5c55\u60c5\u51b5"
+            else:
+                desc = item["summary"]
+                if item["latest_str"]:
+                    desc += f"(\u6700\u8fd1:{item['latest_str']})"
+            if len(desc) > 80:
+                desc = desc[:78] + "\u2026"
+
+            lines.append(f"{idx}. **{tname}**({item['status']}) - {desc} {m}")
+
+    # 任务总览
+    lines.extend(["", "---", "", "## 任务总览", ""])
+
+    cats = [
+        (EMOJI_CHECK, "\u6b63\u5e38\u63a8\u8fdb"),
+        (EMOJI_WARN, "\u9700\u5173\u6ce8"),
+        (EMOJI_CRIT, "\u9700\u91cd\u70b9\u8ddf\u8fdb"),
+        (EMOJI_NONE, "\u65e0\u8bb0\u5f55"),
+        (EMOJI_IDLE, "\u672a\u542f\u52a8"),
+    ]
+
+    for emoji, label in cats:
+        pc = risk_person.get(emoji, {})
+        if not pc:
+            continue
+        total = sum(pc.values())
+        detail = "\u3001".join([f"{n}\u00d7{c}" for n, c in sorted(pc.items(), key=lambda x: -x[1])])
+        lines.append(f"| {emoji} {label} | {total}\u9879 | {detail} |")
+
+    lines.extend(["", "---", f"> \u7edf\u8ba1\u5468\u671f {sys.argv[2]} ~ {pe}"])
+
+    sys.stdout.write("\n".join(lines))
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":
