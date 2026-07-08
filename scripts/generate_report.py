@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 运营项目部任务进度追踪 - 报表生成脚本
-
 从AI表格读取任务数据，按责任人分组，分析近N天内是否有更新，
 生成纯文字序号列表形式的Markdown报表（适配手机端）。
 
@@ -26,19 +25,20 @@ if hasattr(sys.stdout, "reconfigure"):
 USERS = {
     "010303275029427647": "王立江",
     "0251316026046228": "朱一鸣",
-    "110738513124684735": "张鹏明",
+    "110738513124684735": "张明",
     "17313254725534900": "张翔",
     "24570760827765906": "沈刚",
     "034924166424253600": "张柬柬",
 }
 
-USER_ORDER = ["王立江", "朱一鸣", "张鹏明", "张翔", "沈刚", "张柬柬"]
+USER_ORDER = ["王立江", "朱一鸣", "张明", "张翔", "沈刚", "张柬柬"]
 
-EMOJI_CHECK = "\u2705"
-EMOJI_WARN = "\U0001f7e1"
-EMOJI_CRIT = "\U0001f534"
-EMOJI_NONE = "\U0001f6a8"
-EMOJI_IDLE = "\u26aa"
+# 使用纯文本标记代替 emoji（钉钉 MCP 网关会拦截 emoji）
+TAG_OK = "[OK]"
+TAG_WARN = "[关注]"
+TAG_CRIT = "[重点]"
+TAG_NONE = "[无记录]"
+TAG_IDLE = "[未启动]"
 
 
 def extract_latest_date(text):
@@ -47,6 +47,7 @@ def extract_latest_date(text):
         return None, ""
     y = datetime.now().year
     found = []
+    # 匹配 "6.30" 格式的日期
     for m in re.finditer(r"(?:^|[^.])(\d{1,2})[.](\d{1,2})(?=[^.\d]|$)", text):
         try:
             mo, d = int(m.group(1)), int(m.group(2))
@@ -54,6 +55,7 @@ def extract_latest_date(text):
                 found.append((datetime(y, mo, d), f"{mo}.{d}"))
         except ValueError:
             pass
+    # 匹配 "6月30日" 格式
     for m in re.finditer(r"(\d{1,2})\u6708(\d{1,2})\u65e5?", text):
         try:
             mo, d = int(m.group(1)), int(m.group(2))
@@ -61,6 +63,7 @@ def extract_latest_date(text):
                 found.append((datetime(y, mo, d), f"{mo}.{d}"))
         except ValueError:
             pass
+    # 去重（同月同日只保留一次）
     seen = set()
     for dt, s in sorted(found, key=lambda x: x[0], reverse=True):
         k = (dt.month, dt.day)
@@ -70,27 +73,32 @@ def extract_latest_date(text):
     return None, ""
 
 
-def summarize(text):
-    """简化落实情况文本为摘要"""
+def summarize(text, max_len=40):
+    """简化落实情况文本为摘要，取前N个字符"""
     if not text or not text.strip():
         return ""
     lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
-    events = [l[:35] + "\u2026" if len(l) > 35 else l for l in lines]
-    return "\uff1b".join(events[:2])
+    events = []
+    for l in lines:
+        if len(l) > max_len:
+            events.append(l[:max_len] + "...")
+        else:
+            events.append(l)
+    return "；".join(events[:2])
 
 
 def get_risk(status, latest_date, period_start, has_summary):
     """判断风险等级"""
-    if status == "\u672a\u5f00\u59cb":
-        return EMOJI_IDLE
+    if status == "未开始":
+        return TAG_IDLE
     if not has_summary or latest_date is None:
-        return EMOJI_NONE
+        return TAG_NONE
     if latest_date >= period_start:
-        return EMOJI_CHECK
+        return TAG_OK
     elif latest_date >= period_start - timedelta(days=14):
-        return EMOJI_WARN
+        return TAG_WARN
     else:
-        return EMOJI_CRIT
+        return TAG_CRIT
 
 
 def main():
@@ -117,7 +125,7 @@ def main():
         sc = cells.get("CA1vMY7") or {}
         st = sc.get("name", "") if isinstance(sc, dict) else ""
         pc = cells.get("ojHKFAE") or []
-        uid = pc[0]["userId"] if isinstance(pc, list) and pc else "\u672a\u77e5"
+        uid = pc[0]["userId"] if isinstance(pc, list) and pc else "未知"
         name = USERS.get(uid, uid)
         wt = cells.get("BqwY0AR") or ""
         ld, ls = extract_latest_date(wt)
@@ -130,11 +138,11 @@ def main():
             "has_summary": bool(summarize(wt)),
         })
 
-    # stderr 输出统计
+    # stderr 输出统计（调试用）
     for n in USER_ORDER:
         if n in tasks:
             t = len(tasks[n])
-            u = sum(1 for i in tasks[n] if i["status"] != "\u5df2\u5b8c\u6210")
+            u = sum(1 for i in tasks[n] if i["status"] != "已完成")
             print(f"{n}: total={t} unfin={u}", file=sys.stderr)
 
     # 生成 Markdown
@@ -153,8 +161,8 @@ def main():
         if name not in tasks:
             continue
         items = tasks[name]
-        done = [i for i in items if i["status"] == "\u5df2\u5b8c\u6210"]
-        unfin = [i for i in items if i["status"] != "\u5df2\u5b8c\u6210"]
+        done = [i for i in items if i["status"] == "已完成"]
+        unfin = [i for i in items if i["status"] != "已完成"]
         if not unfin:
             continue
 
@@ -163,41 +171,47 @@ def main():
         lines.append("")
 
         for idx, item in enumerate(unfin, 1):
-            m = get_risk(item["status"], item["latest_date"], ps, item["has_summary"])
-            risk_person[m][name] += 1
+            tag = get_risk(item["status"], item["latest_date"], ps, item["has_summary"])
+            risk_person[tag][name] += 1
 
-            tname = item["task"][:40] + "\u2026" if len(item["task"]) > 40 else item["task"]
+            tname = item["task"]
+            if len(tname) > 40:
+                tname = tname[:40] + "..."
+
             if not item["has_summary"]:
-                desc = "\u672a\u8bb0\u5f55\u5de5\u4f5c\u5f00\u5c55\u60c5\u51b5"
+                desc = "未记录工作开展情况"
             else:
                 desc = item["summary"]
                 if item["latest_str"]:
-                    desc += f"(\u6700\u8fd1:{item['latest_str']})"
-            if len(desc) > 80:
-                desc = desc[:78] + "\u2026"
+                    desc += f"(最近:{item['latest_str']})"
 
-            lines.append(f"{idx}. **{tname}**({item['status']}) - {desc} {m}")
+            if len(desc) > 80:
+                desc = desc[:78] + "..."
+
+            lines.append(f"{idx}. **{tname}**({item['status']}) - {desc} {tag}")
 
     # 任务总览
     lines.extend(["", "---", "", "## 任务总览", ""])
 
     cats = [
-        (EMOJI_CHECK, "\u6b63\u5e38\u63a8\u8fdb"),
-        (EMOJI_WARN, "\u9700\u5173\u6ce8"),
-        (EMOJI_CRIT, "\u9700\u91cd\u70b9\u8ddf\u8fdb"),
-        (EMOJI_NONE, "\u65e0\u8bb0\u5f55"),
-        (EMOJI_IDLE, "\u672a\u542f\u52a8"),
+        (TAG_OK, "正常推进"),
+        (TAG_WARN, "需关注"),
+        (TAG_CRIT, "需重点跟进"),
+        (TAG_NONE, "无记录"),
+        (TAG_IDLE, "未启动"),
     ]
 
-    for emoji, label in cats:
-        pc = risk_person.get(emoji, {})
+    for tag, label in cats:
+        pc = risk_person.get(tag, {})
         if not pc:
             continue
         total = sum(pc.values())
-        detail = "\u3001".join([f"{n}\u00d7{c}" for n, c in sorted(pc.items(), key=lambda x: -x[1])])
-        lines.append(f"| {emoji} {label} | {total}\u9879 | {detail} |")
+        detail = "、".join(
+            [f"{n}x{c}" for n, c in sorted(pc.items(), key=lambda x: -x[1])]
+        )
+        lines.append(f"**[{tag}] {label}({total}项)** - {detail}")
 
-    lines.extend(["", "---", f"> \u7edf\u8ba1\u5468\u671f {sys.argv[2]} ~ {pe}"])
+    lines.extend(["", "---", f"> 统计周期 {sys.argv[2]} ~ {pe}"])
 
     sys.stdout.write("\n".join(lines))
     sys.stdout.flush()
